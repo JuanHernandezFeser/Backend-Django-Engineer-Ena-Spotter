@@ -90,6 +90,12 @@ ROUTING_TIMEOUT_SECONDS = env.float("ROUTING_TIMEOUT_SECONDS", default=8.0)
 ROUTE_CACHE_SECONDS = env.int("ROUTE_CACHE_SECONDS", default=86400)
 ROUTE_SIMPLIFY_TOLERANCE = env.float("ROUTE_SIMPLIFY_TOLERANCE", default=0.0002)
 
+TEXT_GEOCODER = env("TEXT_GEOCODER", default="open-meteo").lower()
+OPEN_METEO_URL = env(
+    "OPEN_METEO_URL", default="https://geocoding-api.open-meteo.com/v1/search"
+)
+OPEN_METEO_TIMEOUT_SECONDS = env.float("OPEN_METEO_TIMEOUT_SECONDS", default=10.0)
+
 PHOTON_URL = env("PHOTON_URL", default="https://photon.komoot.io/api")
 PHOTON_USER_AGENT = env(
     "PHOTON_USER_AGENT", default="fuel-route-planner/1.0 (local development)"

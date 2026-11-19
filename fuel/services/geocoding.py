@@ -1,4 +1,4 @@
-"""Location resolution and one-time off-line station geocoding (Photon)."""
+"""Request-time location resolution (Open-Meteo) and offline station ETL (Photon)."""
 
 import hashlib
 import json
@@ -11,6 +11,7 @@ from django.conf import settings
 from django.core.cache import cache
 
 logger = logging.getLogger(__name__)
+_MISSING = object()
 
 CONTINENTAL_US_BBOX = (24.4, 49.4, -125.0, -66.9)
 
@@ -159,6 +160,75 @@ class PhotonClient:
         }
 
 
+class OpenMeteoClient:
+    """Keyless city-level geocoder used for request-time free-text input."""
+
+    def search(self, query: str) -> dict | None:
+        text = query.strip()
+        key = "geocode:open-meteo:v1:" + hashlib.sha256(
+            text.lower().encode()
+        ).hexdigest()
+        cached = cache.get(key, _MISSING)
+        if cached is not _MISSING:
+            return cached
+
+        try:
+            response = requests.get(
+                settings.OPEN_METEO_URL,
+                params={
+                    "name": text,
+                    "count": 5,
+                    "language": "en",
+                    "format": "json",
+                },
+                headers={
+                    "User-Agent": settings.PHOTON_USER_AGENT,
+                    "Accept": "application/json",
+                },
+                timeout=settings.OPEN_METEO_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            result = self._parse(response.json())
+        except requests.RequestException as exc:
+            raise GeocodingError(f"Geocoding failed for '{query}': {exc}") from exc
+
+        cache.set(key, result, settings.GEOCODE_CACHE_SECONDS)
+        return result
+
+    @staticmethod
+    def _parse(payload: dict) -> dict | None:
+        for item in payload.get("results") or []:
+            if (item.get("country_code") or "").lower() != "us":
+                continue
+            try:
+                lat, lon = float(item["latitude"]), float(item["longitude"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not is_in_continental_us(lat, lon):
+                continue
+            parts = (item.get("name"), item.get("admin1"), item.get("country"))
+            return {
+                "lat": lat,
+                "lon": lon,
+                "country_code": "us",
+                "display_name": ", ".join(
+                    dict.fromkeys(str(part) for part in parts if part)
+                ),
+            }
+        return None
+
+
+def get_text_geocoder() -> PhotonClient | OpenMeteoClient:
+    providers = {"open-meteo": OpenMeteoClient, "photon": PhotonClient}
+    try:
+        return providers[settings.TEXT_GEOCODER]()
+    except KeyError as exc:
+        raise GeocodingError(
+            f"Unknown TEXT_GEOCODER '{settings.TEXT_GEOCODER}'. "
+            "Use 'open-meteo' or 'photon'."
+        ) from exc
+
+
 def resolve_location(value: str) -> tuple[float, float, str]:
     """Return (lat, lon, label) for 'lat,lon' or free text."""
     text = value.strip()
@@ -172,12 +242,15 @@ def resolve_location(value: str) -> tuple[float, float, str]:
             )
         return lat, lon, text
 
-    cache_key = "location:v2:" + hashlib.sha256(text.lower().encode()).hexdigest()
+    cache_key = (
+        f"location:{settings.TEXT_GEOCODER}:v1:"
+        + hashlib.sha256(text.lower().encode()).hexdigest()
+    )
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
 
-    result = PhotonClient().search(text)
+    result = get_text_geocoder().search(text)
     if result is None or result.get("country_code") != "us":
         raise LocationNotInUS(f"'{text}' could not be resolved to a USA location.")
     if not is_in_continental_us(result["lat"], result["lon"]):

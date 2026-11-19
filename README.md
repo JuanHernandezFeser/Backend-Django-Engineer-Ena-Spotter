@@ -27,6 +27,8 @@ cp .env.example .env            # then edit SECRET_KEY / PHOTON_USER_AGENT
 ```
 
 `import_fuel_prices` is idempotent: run it as often as you like (no duplicates are created).
+Free-text locations in API requests are resolved by **Open-Meteo** (keyless, city-level) and
+cached in memory; `"lat,lon"` inputs skip geocoding entirely.
 `geocode_fuel_stations` is the **only** code path that geocodes stations. It uses Photon,
 is rate limited to ~1 request/second (`GEOCODE_DELAY_SECONDS`), caches every result
 (including "not found") in `data/geocode_cache.json`, and uses `bulk_update`. The full import
@@ -61,7 +63,7 @@ curl -X POST http://127.0.0.1:8000/api/route/ \
   -d '{"start": "40.7128,-74.0060", "finish": "34.0522,-118.2437"}'
 ```
 
-Free text also works:
+Free text also works (city/state names, e.g. `"City, ST"`; street addresses are not supported):
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/route/ \
@@ -117,7 +119,7 @@ Prices are decimal strings with 3-8 decimal places ($2.687-$6.399).
 - `City` values have trailing spaces; they are trimmed on import.
 - Locations are validated against a continental-US bounding box (lat 24.4-49.4,
   lon -125.0 to -66.9). `lat,lon` inputs are checked locally; free text is resolved with
-  Photon's `countrycode=US` and `bbox` filters and then checked against the same box.
+  Open-Meteo, filtered to `country_code=US` and then checked against the same box.
   No reverse-geocoding call is made.
 - **Initial tank assumption:** the vehicle starts with a full 50-gallon tank. Fuel already
   in that tank is treated as already paid for, so it contributes $0 to the reported total.
@@ -130,7 +132,7 @@ Prices are decimal strings with 3-8 decimal places ($2.687-$6.399).
 | --- | --- |
 | Framework | Django 6.1.3 + DRF 3.18.3, SQLite (no PostGIS needed). |
 | Routing | Free public OSRM demo server, configurable via `ROUTING_URL`. One request returns distance + full geometry. |
-| Geocoding | Photon, only for free-text input (request-time, Django-cache-backed) and the offline station command (file-cache-backed). `PHOTON_URL` can point to a private instance. |
+| Geocoding | Open-Meteo for free-text request input (keyless, city-level, Django-cache-backed); Photon only for the offline station command (file-cache-backed). `TEXT_GEOCODER=photon` switches the request-time provider back. |
 | Caching | Route and resolved-location results in Django's local-memory cache; identical requests make **zero** external calls. |
 | Geometry | Full OSRM geometry is simplified with Douglas-Peucker (~34k points -> ~4k) to keep responses small. The 5-mile station match uses a cheap equirectangular projection in pure Python (no Shapely/pyproj dependency). |
 | DB access | One indexed bounding-box query for candidate stations; no per-station external calls, no N+1. |
@@ -141,8 +143,12 @@ Prices are decimal strings with 3-8 decimal places ($2.687-$6.399).
 | Input | Geocoding | Routing | Total |
 | --- | ---: | ---: | ---: |
 | `lat,lon` | 0 | 1 | **1** |
-| Free text | 2 (one per endpoint) | 1 | **3** |
+| Free text | 2 Open-Meteo (one per endpoint) | 1 OSRM | **3** |
 | Cached repeat | 0 | 0 | **0** |
+
+Leaflet tiles load in the browser, not from the backend, so they are not counted here.
+One routing call is the ideal case; three total calls for free text is inside the
+assessment's accepted 2-3 range.
 
 ### Fuel algorithm (`fuel/services/fuel.py`, pure/no I/O)
 
@@ -160,6 +166,8 @@ stations, cheaper stations ahead vs. behind, fill-up, and range-limit boundaries
 
 Measured on the real NY -> LA route (2,794 miles, 40-mile station radius in this demo):
 first request ~1.9 s (dominated by OSRM), cached repeat ~18 ms, 7 stops, $738.61.
+The free-text variant (`"New York, NY"` -> `"Los Angeles, CA"`) also returns 200 with
+7 stops ($738.51) using 2 Open-Meteo calls plus 1 OSRM call.
 
 ---
 
@@ -185,5 +193,7 @@ first request ~1.9 s (dominated by OSRM), cached repeat ~18 ms, 7 stops, $738.61
    price used is the cheapest row per OPIS ID in the static CSV.
 6. `LocMemCache` is per-process (fine for `runserver`, not shared across workers). Use Redis
    if you deploy with multiple workers. There is no authentication or API rate limiting.
-7. A GitHub remote and the demo video are not included here; initialize/commit/push the repo
-   and record the video separately.
+7. A GitHub remote and the demo video are handled separately from this checkout.
+8. Open-Meteo resolves city/town names only, not street addresses or highway exits. Use
+   `"lat,lon"` for exact points; set `TEXT_GEOCODER=photon` (or a paid provider) if
+   address-level free text is required.

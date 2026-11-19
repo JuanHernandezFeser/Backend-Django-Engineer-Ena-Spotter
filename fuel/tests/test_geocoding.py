@@ -13,7 +13,9 @@ from fuel.models import FuelStation
 from fuel.services.geocoding import (
     GeocodingError,
     LocationNotInUS,
+    OpenMeteoClient,
     PhotonClient,
+    get_text_geocoder,
     resolve_location,
 )
 
@@ -32,12 +34,115 @@ PHOTON_PAYLOAD = {
     ]
 }
 
+OPEN_METEO_PAYLOAD = {
+    "results": [
+        {
+            "name": "Paris",
+            "latitude": 48.85341,
+            "longitude": 2.3488,
+            "country_code": "FR",
+            "admin1": "Île-de-France",
+            "country": "France",
+        },
+        {
+            "name": "New York",
+            "latitude": 40.71427,
+            "longitude": -74.00597,
+            "country_code": "US",
+            "admin1": "New York",
+            "country": "United States",
+        },
+    ]
+}
+
 
 def photon_response(payload: dict) -> Mock:
     response = Mock()
     response.json.return_value = payload
     response.raise_for_status.return_value = None
     return response
+
+
+def open_meteo_response(payload: dict) -> Mock:
+    response = Mock()
+    response.json.return_value = payload
+    response.raise_for_status.return_value = None
+    return response
+
+
+class OpenMeteoClientTests(TestCase):
+    def setUp(self):
+        cache.clear()
+
+    @patch("fuel.services.geocoding.requests.get")
+    def test_search_parses_first_us_result_and_sends_expected_params(self, mock_get):
+        mock_get.return_value = open_meteo_response(OPEN_METEO_PAYLOAD)
+
+        result = OpenMeteoClient().search("New York, NY")
+
+        self.assertEqual(result["lat"], 40.71427)
+        self.assertEqual(result["lon"], -74.00597)
+        self.assertEqual(result["country_code"], "us")
+        self.assertEqual(result["display_name"], "New York, United States")
+        mock_get.assert_called_once_with(
+            settings.OPEN_METEO_URL,
+            params={"name": "New York, NY", "count": 5,
+                    "language": "en", "format": "json"},
+            headers={
+                "User-Agent": settings.PHOTON_USER_AGENT,
+                "Accept": "application/json",
+            },
+            timeout=settings.OPEN_METEO_TIMEOUT_SECONDS,
+        )
+
+    @patch("fuel.services.geocoding.requests.get")
+    def test_search_caches_empty_results_and_filters_non_us(self, mock_get):
+        mock_get.return_value = open_meteo_response(
+            {"results": [OPEN_METEO_PAYLOAD["results"][0]]}
+        )
+        client = OpenMeteoClient()
+
+        self.assertIsNone(client.search("Paris"))
+        self.assertIsNone(client.search("Paris"))
+        self.assertEqual(mock_get.call_count, 1)
+
+    @patch("fuel.services.geocoding.OpenMeteoClient.search")
+    def test_resolve_location_uses_open_meteo_by_default(self, mock_search):
+        mock_search.return_value = {
+            "lat": 40.71427,
+            "lon": -74.00597,
+            "country_code": "us",
+            "display_name": "New York, New York, United States",
+        }
+
+        resolved = resolve_location("New York, NY")
+
+        self.assertEqual(resolved, (40.71427, -74.00597,
+                                    "New York, New York, United States"))
+        self.assertEqual(mock_search.call_count, 1)
+        self.assertEqual(resolve_location("New York, NY"), resolved)
+        self.assertEqual(mock_search.call_count, 1)
+
+    @override_settings(TEXT_GEOCODER="photon")
+    @patch("fuel.services.geocoding.PhotonClient.search")
+    def test_resolve_location_can_use_photon_when_configured(self, mock_search):
+        mock_search.return_value = {
+            "lat": 36.5378651,
+            "lon": -95.221358,
+            "country_code": "us",
+            "display_name": "Big Cabin, Oklahoma, United States",
+        }
+
+        self.assertEqual(
+            resolve_location("Big Cabin, OK"),
+            (36.5378651, -95.221358, "Big Cabin, Oklahoma, United States"),
+        )
+        self.assertEqual(mock_search.call_count, 1)
+
+    def test_get_text_geocoder_rejects_unknown_provider(self):
+        with override_settings(TEXT_GEOCODER="nope"):
+            with self.assertRaises(GeocodingError):
+                get_text_geocoder()
 
 
 class PhotonClientTests(TestCase):
@@ -126,7 +231,7 @@ class PhotonClientTests(TestCase):
         self.assertEqual(self.session.get.call_count, settings.PHOTON_RETRIES + 1)
 
     @patch(
-        "fuel.services.geocoding.PhotonClient.search",
+        "fuel.services.geocoding.OpenMeteoClient.search",
         return_value={
             "lat": 48.8,
             "lon": 2.3,
