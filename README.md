@@ -13,7 +13,7 @@ Django 6.1 requires Python >= 3.12; this project was developed with Python 3.13.
 ```bash
 uv venv --python 3.13 .venv
 uv pip install --python .venv/Scripts/python.exe -r requirements.txt
-cp .env.example .env            # then edit SECRET_KEY / NOMINATIM_USER_AGENT
+cp .env.example .env            # then edit SECRET_KEY / PHOTON_USER_AGENT
 .venv/Scripts/python.exe manage.py migrate
 ```
 
@@ -27,11 +27,12 @@ cp .env.example .env            # then edit SECRET_KEY / NOMINATIM_USER_AGENT
 ```
 
 `import_fuel_prices` is idempotent: run it as often as you like (no duplicates are created).
-`geocode_fuel_stations` is the **only** code path that geocodes stations. It is rate limited
-to ~1 request/second, caches every result (including "not found") in `data/geocode_cache.json`,
-and uses `bulk_update`. The full import has ~6,626 US stations, so a complete geocode takes
-roughly 2 hours; use `--limit` for a demo and `--force` to retry already-geocoded rows.
-The API never geocodes a station during a request.
+`geocode_fuel_stations` is the **only** code path that geocodes stations. It uses Photon,
+is rate limited to ~1 request/second (`GEOCODE_DELAY_SECONDS`), caches every result
+(including "not found") in `data/geocode_cache.json`, and uses `bulk_update`. The full import
+has ~6,626 US stations, so a complete sequential geocode takes roughly 2-2.5 hours. Use
+`--limit` for a demo and `--force` to retry already-geocoded rows; interrupted runs can be
+resumed by re-running without `--force`. The API never geocodes a station during a request.
 
 For the NY -> LA verification below, stations in the cities along the route were geocoded
 with a small one-off shell snippet and `STATION_SEARCH_RADIUS_MILES=40` (see limitation #1).
@@ -116,7 +117,8 @@ Prices are decimal strings with 3-8 decimal places ($2.687-$6.399).
 - `City` values have trailing spaces; they are trimmed on import.
 - Locations are validated against a continental-US bounding box (lat 24.4-49.4,
   lon -125.0 to -66.9). `lat,lon` inputs are checked locally; free text is resolved with
-  `countrycodes=us` and then checked against the same box. No reverse-geocoding call is made.
+  Photon's `countrycode=US` and `bbox` filters and then checked against the same box.
+  No reverse-geocoding call is made.
 - **Initial tank assumption:** the vehicle starts with a full 50-gallon tank. Fuel already
   in that tank is treated as already paid for, so it contributes $0 to the reported total.
 
@@ -128,7 +130,7 @@ Prices are decimal strings with 3-8 decimal places ($2.687-$6.399).
 | --- | --- |
 | Framework | Django 6.1.3 + DRF 3.18.3, SQLite (no PostGIS needed). |
 | Routing | Free public OSRM demo server, configurable via `ROUTING_URL`. One request returns distance + full geometry. |
-| Geocoding | Nominatim, only for free-text input (request-time, Django-cache-backed) and the offline station command (file-cache-backed). |
+| Geocoding | Photon, only for free-text input (request-time, Django-cache-backed) and the offline station command (file-cache-backed). `PHOTON_URL` can point to a private instance. |
 | Caching | Route and resolved-location results in Django's local-memory cache; identical requests make **zero** external calls. |
 | Geometry | Full OSRM geometry is simplified with Douglas-Peucker (~34k points -> ~4k) to keep responses small. The 5-mile station match uses a cheap equirectangular projection in pure Python (no Shapely/pyproj dependency). |
 | DB access | One indexed bounding-box query for candidate stations; no per-station external calls, no N+1. |
@@ -163,13 +165,17 @@ first request ~1.9 s (dominated by OSRM), cached repeat ~18 ms, 7 stops, $738.61
 
 ## 7. Known limitations
 
-1. Station addresses are highway exits, which Nominatim usually cannot resolve. The importer
+1. Station addresses are highway exits, which Photon usually cannot resolve. The importer
    falls back to a **city centroid**, so station coordinates are approximate. The default
    match radius is 5 miles; with city-level geocodes raise `STATION_SEARCH_RADIUS_MILES`
    (20-40 works for the demo). If you need precise stops, geocode with a paid/accurate
    provider once and store the results.
-2. The full station geocode is intentionally slow (~2 h at 1 req/sec) and must respect
-   Nominatim's usage policy. It has not been run to completion in this checkout.
+2. The full station geocode is intentionally slow (~2-2.5 h at 1 req/sec) to stay inside
+   the public Photon demo's fair-use limits; `Retry-After` is honored, the disk cache makes
+   reruns/resumes cheap, and the command aborts after `PHOTON_MAX_CONSECUTIVE_FAILURES`
+   (default 10) so an outage does not burn through all stations. For a much faster bulk
+   pass, point `PHOTON_URL` at a private Photon instance and lower
+   `GEOCODE_DELAY_SECONDS`. It has not been run to completion in this checkout.
 3. The public OSRM demo server is rate-limited and has no SLA. For production, use your own
    OSRM instance or OpenRouteService with `ORS_API_KEY` support added to `services/routing.py`.
 4. Only the continental USA is supported; Alaska, Hawaii and Canada are intentionally out of

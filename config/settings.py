@@ -90,19 +90,19 @@ ROUTING_TIMEOUT_SECONDS = env.float("ROUTING_TIMEOUT_SECONDS", default=8.0)
 ROUTE_CACHE_SECONDS = env.int("ROUTE_CACHE_SECONDS", default=86400)
 ROUTE_SIMPLIFY_TOLERANCE = env.float("ROUTE_SIMPLIFY_TOLERANCE", default=0.0002)
 
-NOMINATIM_URL = env(
-    "NOMINATIM_URL", default="https://nominatim.openstreetmap.org/search"
-)
-NOMINATIM_USER_AGENT = env(
-    "NOMINATIM_USER_AGENT", default="fuel-route-planner/1.0 (local development)"
+PHOTON_URL = env("PHOTON_URL", default="https://photon.komoot.io/api")
+PHOTON_USER_AGENT = env(
+    "PHOTON_USER_AGENT", default="fuel-route-planner/1.0 (local development)"
 )
 GEOCODE_CACHE_SECONDS = env.int("GEOCODE_CACHE_SECONDS", default=604800)
 GEOCODE_CACHE_FILE = env(
     "GEOCODE_CACHE_FILE", default=str(BASE_DIR / "data" / "geocode_cache.json")
 )
 GEOCODE_DELAY_SECONDS = env.float("GEOCODE_DELAY_SECONDS", default=1.1)
-NOMINATIM_TIMEOUT_SECONDS = env.float("NOMINATIM_TIMEOUT_SECONDS", default=20.0)
-NOMINATIM_RETRIES = env.int("NOMINATIM_RETRIES", default=2)
+PHOTON_CONNECT_TIMEOUT_SECONDS = env.float("PHOTON_CONNECT_TIMEOUT_SECONDS", default=5.0)
+PHOTON_TIMEOUT_SECONDS = env.float("PHOTON_TIMEOUT_SECONDS", default=20.0)
+PHOTON_RETRIES = env.int("PHOTON_RETRIES", default=2)
+PHOTON_MAX_CONSECUTIVE_FAILURES = env.int("PHOTON_MAX_CONSECUTIVE_FAILURES", default=10)
 
 STATION_SEARCH_RADIUS_MILES = env.float("STATION_SEARCH_RADIUS_MILES", default=5.0)
 TANK_RANGE_MILES = env.float("TANK_RANGE_MILES", default=500.0)
