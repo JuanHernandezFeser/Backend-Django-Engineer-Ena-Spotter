@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fuel route: {{ start }} to {{ finish }}</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; }
+    #map { height: 65vh; }
+    .panel { padding: 12px 20px; }
+    .error { color: #b00020; }
+    table { border-collapse: collapse; width: 100%; max-width: 900px; }
+    th, td { border-bottom: 1px solid #ddd; padding: 6px 8px; text-align: left; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="panel">
+    <h2>{{ start }} &rarr; {{ finish }}</h2>
+    {% if error %}<p class="error">{{ error }}</p>{% endif %}
+    {% if route %}
+      <p>{{ distance_miles }} miles &middot; ${{ total_fuel_cost }} fuel &middot; {{ stops|length }} stop(s)</p>
+      <table>
+        <thead><tr><th>#</th><th>Station</th><th>Address</th><th>Mile</th><th>$/gal</th><th>Gal</th><th>Cost</th></tr></thead>
+        <tbody>
+        {% for stop in stops %}
+          <tr><td>{{ forloop.counter }}</td><td>{{ stop.name }}</td><td>{{ stop.address }}, {{ stop.city }}, {{ stop.state }}</td><td>{{ stop.miles_from_start }}</td><td>{{ stop.price_per_gallon }}</td><td>{{ stop.gallons_purchased }}</td><td>${{ stop.cost }}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+  </div>
+
+  {{ route|json_script:"route-data" }}
+  {{ stops|json_script:"stops-data" }}
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const route = JSON.parse(document.getElementById('route-data').textContent);
+    const stops = JSON.parse(document.getElementById('stops-data').textContent);
+    if (route) {
+      const map = L.map('map');
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors'
+      }).addTo(map);
+      const line = L.geoJSON(route).addTo(map);
+      map.fitBounds(line.getBounds(), { padding: [30, 30] });
+      stops.forEach(function (stop, index) {
+        const label = document.createElement('div');
+        label.textContent = (index + 1) + '. ' + stop.name + ' — ' + stop.address +
+          ', ' + stop.city + ', ' + stop.state + ' — ' + stop.gallons_purchased +
+          ' gal @ $' + stop.price_per_gallon + ' = $' + stop.cost;
+        L.marker([stop.lat, stop.lon]).bindPopup(label).addTo(map);
+      });
+    }
+  </script>
+</body>
+</html>
