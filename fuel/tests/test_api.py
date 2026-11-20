@@ -84,7 +84,7 @@ class RouteAPITests(TestCase):
 
     def test_free_text_uses_two_geocode_calls_and_one_routing_call(self):
         with patch(
-            "fuel.services.geocoding.OpenMeteoClient.search",
+            "fuel.services.geocoding.providers.OpenMeteoClient.search",
             side_effect=[geo_result(40.0, -100.0), geo_result(40.0, -89.0)],
         ) as mock_search, patch(
             "fuel.services.routing.requests.get", return_value=osrm_response()
@@ -108,7 +108,7 @@ class RouteAPITests(TestCase):
 
     def test_non_us_location_returns_404_location_not_found(self):
         with patch(
-            "fuel.services.geocoding.OpenMeteoClient.search",
+            "fuel.services.geocoding.providers.OpenMeteoClient.search",
             return_value=geo_result(48.8, 2.3, "fr"),
         ) as mock_search, self.assertLogs("fuel.exceptions", level="WARNING") as logs:
             response = self.client.post(

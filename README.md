@@ -17,9 +17,12 @@ uv venv --python 3.13 .venv
 uv pip install --python .venv\Scripts\python.exe -r requirements.txt
 Copy-Item .env.example .env   # edit SECRET_KEY and other values as needed
 .venv\Scripts\python.exe manage.py migrate
+.venv\Scripts\python.exe manage.py loaddata fuel_stations
 ```
 
 Without `uv`: create/activate a venv and run `pip install -r requirements.txt`, then use `.venv\Scripts\python.exe` for `manage.py` commands.
+
+`fuel_stations` is a snapshot fixture of the geocoded station dataset (6,626 stations). Load it on an empty database (after `migrate`, before loading other station data). To regenerate station data from the CSV instead, use the alternative commands below.
 
 ## Environment variables
 
@@ -55,13 +58,12 @@ All values are read in `config/settings.py` and mirrored in `.env.example`.
 
 ## Data flow
 
-1. **Import (offline):** `import_fuel_prices` loads US stations/prices from the CSV into `FuelStation` (idempotent, keeps lowest price per station).
-2. **Geocoding (offline):** `geocode_fuel_stations` assigns `lat/lon` to stations (Photon bulk or Open-Meteo per city). Re-runs resume pending rows; the API never geocodes stations.
-3. **API (request-time):** resolve `start`/`finish` (text via configured geocoder or `"lat,lon"`), fetch one driving route from OSRM, find stations near the route, plan stops/purchases, return route GeoJSON, stops, and `total_fuel_cost`.
+1. **Station data (offline):** load the provided `fuel_stations` fixture on an empty database (`loaddata fuel_stations`, snapshot of geocoded stations). Alternatively, regenerate from the CSV: `import_fuel_prices` loads stations/prices, then `geocode_fuel_stations` assigns `lat/lon` (slow, resumable; see commands below). The API never geocodes stations at request time.
+2. **API (request-time):** resolve `start`/`finish` (text via configured geocoder or `"lat,lon"`), fetch one driving route from OSRM, find stations near the route, plan stops/purchases, return route GeoJSON, stops, and `total_fuel_cost`.
 
-## Management commands
+## Management commands (alternative: regenerate from CSV)
 
-Run with `.venv\Scripts\python.exe manage.py <command> ...`
+Use these to rebuild station data from the CSV instead of loading the fixture. Run with `.venv\Scripts\python.exe manage.py <command> ...`
 
 ### `import_fuel_prices`
 
@@ -321,7 +323,7 @@ Example: `http://127.0.0.1:8000/api/route/map/?start=33.4484,-112.0740&finish=31
 - **`fuel/views.py`**: thin HTTP layer (request parsing/validation delegation, service call, response). `RouteAPIView` (JSON) and `route_map` (HTML) use the same service; domain errors map to consistent statuses/codes.
 - **`fuel/serializers.py`**: request validation (`start`, `finish`).
 - **`fuel/services/planner.py`**: orchestration (`resolve_location` -> `get_route` -> `nearby_stations`/origin selection -> `plan_fuel_stops` -> response shape).
-- **`fuel/services/geocoding.py`**: request-time location resolution and provider clients (`OpenMeteoClient` for requests, `PhotonClient` for offline ETL/cache). Input/area validation and external-failure classification.
+- **`fuel/services/geocoding/`** (package): `request.py` (request-time input validation and `resolve_location`/text-geocoder selection), `providers.py` (shared `OpenMeteoClient`, used by request-time resolution and offline city geocoding), `offline.py` (`PhotonClient`: disk cache, rate limiting, retries for offline ETL only), `common.py` (shared constants/helpers and compatibility exceptions). Request-time flow must not import offline modules; the API never geocodes stations at request time.
 - **`fuel/services/routing.py`**: OSRM routing, geometry simplification, caching, and external-failure/routability classification.
 - **`fuel/services/stations.py`**: station lookup near the route and origin selection (data access/projection).
 - **`fuel/services/fuel.py`**: pure fuel planning and cost calculation (no Django/DB/network).
@@ -332,12 +334,12 @@ Example: `http://127.0.0.1:8000/api/route/map/?start=33.4484,-112.0740&finish=31
 ## Decisions and limitations
 
 - **Offline station geocoding:** the API never geocodes stations at request time. Station coordinates come from `geocode_fuel_stations` (Photon bulk or Open-Meteo by city/`--all-cities`, resumable and cached on disk for Photon).
+- **Station coordinates (known limitation):** the source CSV has no coordinates. All 6,626 stations are geocoded offline; roughly 62% are placed at their city centroid (Open-Meteo) and roughly 38% at a per-station location (Photon). Provenance is not stored and these percentages are inferred from coordinate uniqueness. Prices and total cost always use each station's real price; what is approximate is station position, so with STATION_SEARCH_RADIUS_MILES=5 a centroid-placed station may be included or excluded relative to its true location, and its mile marker along the route is approximate. A production version would use highway-exit-level coordinates.
 - **Route proximity:** candidate stations are those within `STATION_SEARCH_RADIUS_MILES` of the route geometry (bounding-box prefilter plus segment projection). Each stop is assigned a mile marker along the route; the origin station is the nearest candidate to the start within the search radius.
 - **Fuel/cost model:** 10 mpg, `TANK_RANGE_MILES` tank (500 mi). Initial purchase is made at the origin station and included in `total_fuel_cost` using the same buy rule as stops (sufficient for destination/cheaper reachable station, else fill). A zero-distance trip costs 0.
 - **Unroutable input:** OSRM `NoRoute`/`NoSegment` (e.g. points not snappable to the road network) are treated as `422 route_not_feasible` (valid input but not fulfillable), not as an external service failure.
 - **External rate limiting:** provider HTTP 429 is mapped to `503 external_rate_limited` and forwards `Retry-After` when supplied.
 - **Provider failures:** timeouts -> 504, connection/upstream 5xx/unavailable -> 503, invalid/unexpected responses -> 502. Client messages are fixed per code; request/exception details are logged server-side.
-- **Geocoding coverage/accuracy:** station geocoding may be approximate (e.g. city-centroid in Open-Meteo modes) and depends on imported/geocoded data and `STATION_SEARCH_RADIUS_MILES`; sparse coverage can yield `route_not_feasible`.
 - **Routing/geocoding providers:** defaults use the public OSRM demo and Open-Meteo; availability, quotas, and terms are governed by those services.
 
 No secrets are stored in the repository; configure sensitive values (e.g. `SECRET_KEY`) in `.env`.

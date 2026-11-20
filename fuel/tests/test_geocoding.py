@@ -7,17 +7,12 @@ from django.conf import settings
 from django.core.cache import cache
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.test import TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 
 from fuel.models import FuelStation
-from fuel.services.geocoding import (
-    GeocodingError,
-    LocationNotInUS,
-    OpenMeteoClient,
-    PhotonClient,
-    get_text_geocoder,
-    resolve_location,
-)
+from fuel.services.geocoding.offline import GeocodingError, PhotonClient
+from fuel.services.geocoding.providers import OpenMeteoClient
+from fuel.services.geocoding.request import get_text_geocoder, resolve_location
 
 PHOTON_PAYLOAD = {
     "features": [
@@ -74,7 +69,7 @@ class OpenMeteoClientTests(TestCase):
     def setUp(self):
         cache.clear()
 
-    @patch("fuel.services.geocoding.requests.get")
+    @patch("fuel.services.geocoding.providers.requests.get")
     def test_search_parses_first_us_result_and_sends_expected_params(self, mock_get):
         mock_get.return_value = open_meteo_response(OPEN_METEO_PAYLOAD)
 
@@ -95,7 +90,7 @@ class OpenMeteoClientTests(TestCase):
             timeout=settings.OPEN_METEO_TIMEOUT_SECONDS,
         )
 
-    @patch("fuel.services.geocoding.requests.get")
+    @patch("fuel.services.geocoding.providers.requests.get")
     def test_search_caches_empty_results_and_filters_non_us(self, mock_get):
         mock_get.return_value = open_meteo_response(
             {"results": [OPEN_METEO_PAYLOAD["results"][0]]}
@@ -106,7 +101,7 @@ class OpenMeteoClientTests(TestCase):
         self.assertIsNone(client.search("Paris"))
         self.assertEqual(mock_get.call_count, 1)
 
-    @patch("fuel.services.geocoding.requests.get")
+    @patch("fuel.services.geocoding.providers.requests.get")
     def test_search_falls_back_to_city_name_and_matches_state(self, mock_get):
         mock_get.side_effect = [
             open_meteo_response({"results": []}),
@@ -133,7 +128,7 @@ class OpenMeteoClientTests(TestCase):
         self.assertEqual(mock_get.call_count, 2)
         self.assertEqual(mock_get.call_args_list[1].kwargs["params"]["name"], "Aberdeen")
 
-    @patch("fuel.services.geocoding.OpenMeteoClient.search")
+    @patch("fuel.services.geocoding.providers.OpenMeteoClient.search")
     def test_resolve_location_uses_open_meteo_by_default(self, mock_search):
         mock_search.return_value = {
             "lat": 40.71427,
@@ -233,7 +228,7 @@ class PhotonClientTests(TestCase):
         )
         self.session.get.side_effect = [throttled, photon_response(PHOTON_PAYLOAD)]
 
-        with patch("fuel.services.geocoding.time.sleep") as mock_sleep:
+        with patch("fuel.services.geocoding.offline.time.sleep") as mock_sleep:
             result = self.make_client().search("Big Cabin, OK, USA")
 
         self.assertEqual(result["lat"], 36.5378651)
@@ -247,7 +242,7 @@ class PhotonClientTests(TestCase):
         )
         self.session.get.return_value = forbidden
 
-        with patch("fuel.services.geocoding.time.sleep"):
+        with patch("fuel.services.geocoding.offline.time.sleep"):
             with self.assertRaises(GeocodingError) as ctx:
                 self.make_client().search("Big Cabin, OK, USA")
 
@@ -255,7 +250,7 @@ class PhotonClientTests(TestCase):
         self.assertEqual(self.session.get.call_count, settings.PHOTON_RETRIES + 1)
 
     @patch(
-        "fuel.services.geocoding.OpenMeteoClient.search",
+        "fuel.services.geocoding.providers.OpenMeteoClient.search",
         return_value={
             "lat": 48.8,
             "lon": 2.3,
@@ -355,3 +350,67 @@ class GeocodeCommandTests(TestCase):
         self.assertEqual((houston.lat, houston.lon), (29.7604, -95.3698))
         self.assertEqual((already.lat, already.lon), (39.7, -104.9))
         self.assertEqual(mock_search.call_count, 2)
+
+
+class GeocodingBoundaryTests(SimpleTestCase):
+    def test_request_time_module_dependency_graph(self):
+        import ast
+        from pathlib import Path
+
+        pkg = Path(__file__).resolve().parents[1] / "services" / "geocoding"
+        allowed = {
+            "common": set(),
+            "providers": {"common"},
+            "request": {"common", "providers"},
+            "offline": {"common"},
+            "__init__": set(),
+        }
+
+        for mod, allowed_deps in allowed.items():
+            path = pkg / f"{mod}.py"
+            source = path.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(path))
+            deps = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    if node.level == 1 and node.module:
+                        deps.add(node.module.split(".")[0])
+                    elif node.level == 0 and node.module and node.module.startswith(
+                        "fuel.services.geocoding."
+                    ):
+                        deps.add(node.module.split(".")[-1])
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.name.startswith("fuel.services.geocoding."):
+                            deps.add(alias.name.split(".")[-1])
+            package_deps = {d for d in deps if d in allowed}
+            self.assertEqual(
+                package_deps,
+                allowed_deps,
+                f"{mod} imports {package_deps}, expected {allowed_deps}",
+            )
+            if mod == "offline":
+                self.assertNotIn("request", package_deps)
+
+    def test_request_time_module_does_not_import_offline(self):
+        import os
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        project_root = Path(__file__).resolve().parents[2]
+        code = (
+            "import os, sys; "
+            "os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings'); "
+            "import fuel.services.geocoding.request; "
+            "print('loaded' if 'fuel.services.geocoding.offline' in sys.modules else 'not-loaded')"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(project_root),
+            capture_output=True,
+            text=True,
+            check=True,
+            env={**os.environ, "DJANGO_SETTINGS_MODULE": "config.settings"},
+        )
+        self.assertEqual(result.stdout.strip(), "not-loaded")

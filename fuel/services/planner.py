@@ -3,7 +3,7 @@
 from django.conf import settings
 
 from .fuel import EPS, plan_fuel_stops
-from .geocoding import resolve_location
+from .geocoding.request import resolve_location
 from .routing import get_route
 from .stations import nearby_stations, select_origin_station
 

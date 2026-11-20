@@ -8,12 +8,9 @@ from django.db import transaction
 from django.utils import timezone
 
 from fuel.models import FuelStation
-from fuel.services.geocoding import (
-    GeocodingError,
-    OpenMeteoClient,
-    PhotonClient,
-    is_in_continental_us,
-)
+from fuel.services.geocoding.common import is_in_continental_us
+from fuel.services.geocoding.offline import GeocodingError, PhotonClient
+from fuel.services.geocoding.providers import OpenMeteoClient
 
 
 class Command(BaseCommand):
