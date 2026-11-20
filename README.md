@@ -1,199 +1,343 @@
-# Fuel Route Planner (Backend Django assessment)
+# Fuel Route Planner
 
-A small Django REST API that takes two USA locations and returns the driving route,
-cost-effective fuel stops for a 500-mile-range vehicle (10 mpg), and the total fuel cost.
+Django REST API that takes two USA locations and returns the driving route, cost-effective fuel stops for a 500-mile-range vehicle (10 mpg), and the total fuel cost.
 
-Verified versions (PyPI, checked 2026-11-19): **Django 6.1.3**, **djangorestframework 3.18.3**.
-Django 6.1 requires Python >= 3.12; this project was developed with Python 3.13.
+- Fuel cost is the sum of purchases at 10 mpg (500-mile tank). The trip starts with an initial purchase at an origin station near the start, charged using the same rule as later stops (buy only enough to reach the destination or a cheaper reachable station, otherwise fill the tank). If the route distance is zero, `total_fuel_cost` is `"0.00"`.
+- Request-time geocoding/routing use external providers (Open-Meteo by default for text, OSRM for routing). Station coordinates are prepared offline; the API never geocodes stations during a request.
 
----
+Verified versions (PyPI, checked 2026-11-19): **Django 6.1.3**, **djangorestframework 3.18.3**, **requests 2.34.2**, **django-environ 0.14.0**. Django 6.1 requires Python >= 3.12.
 
-## 1. Setup
+## Requirements and installation
 
-```bash
+- Python >= 3.12 (developed with 3.13)
+- Windows (project paths/commands below use Windows conventions)
+
+```powershell
 uv venv --python 3.13 .venv
-uv pip install --python .venv/Scripts/python.exe -r requirements.txt
-cp .env.example .env            # then edit SECRET_KEY / PHOTON_USER_AGENT
-.venv/Scripts/python.exe manage.py migrate
+uv pip install --python .venv\Scripts\python.exe -r requirements.txt
+Copy-Item .env.example .env   # edit SECRET_KEY and other values as needed
+.venv\Scripts\python.exe manage.py migrate
 ```
 
-(If you do not use `uv`: `python -m venv .venv`, activate it, then `pip install -r requirements.txt`.)
+Without `uv`: create/activate a venv and run `pip install -r requirements.txt`, then use `.venv\Scripts\python.exe` for `manage.py` commands.
 
-## 2. Load the data
+## Environment variables
 
-```bash
-.venv/Scripts/python.exe manage.py import_fuel_prices
-.venv/Scripts/python.exe manage.py geocode_fuel_stations --limit 100
+All values are read in `config/settings.py` and mirrored in `.env.example`.
+
+| Name | Default | Description |
+|---|---|---|
+| `SECRET_KEY` | `local-development-only-not-a-secret` | Django secret key. |
+| `DEBUG` | `False` | Django debug mode. |
+| `ALLOWED_HOSTS` | `localhost,127.0.0.1,testserver` | Comma-separated allowed hosts. |
+| `DB_NAME` | `<BASE_DIR>/db.sqlite3` | SQLite database path. |
+| `ROUTING_URL` | `https://router.project-osrm.org/route/v1/driving` | OSRM-compatible routing base URL. |
+| `ROUTING_TIMEOUT_SECONDS` | `8.0` | Routing request timeout (seconds). |
+| `ROUTE_CACHE_SECONDS` | `86400` | Cache TTL for route results. |
+| `ROUTE_SIMPLIFY_TOLERANCE` | `0.0002` | Douglas-Peucker tolerance for route geometry simplification. |
+| `TEXT_GEOCODER` | `open-meteo` | Request-time text geocoder (must be `open-meteo`). |
+| `OPEN_METEO_URL` | `https://geocoding-api.open-meteo.com/v1/search` | Open-Meteo geocoding endpoint. |
+| `OPEN_METEO_TIMEOUT_SECONDS` | `10.0` | Open-Meteo request timeout (seconds). |
+| `OPEN_METEO_MAX_CONSECUTIVE_FAILURES` | `20` | Abort threshold for `--all-cities` geocoding. |
+| `PHOTON_URL` | `https://photon.komoot.io/api` | Photon endpoint (offline station geocoding). |
+| `PHOTON_USER_AGENT` | `fuel-route-planner/1.0 (local development)` | User-Agent for geocoding requests. |
+| `GEOCODE_CACHE_SECONDS` | `604800` | Cache TTL for resolved text locations (memory). |
+| `GEOCODE_CACHE_FILE` | `<BASE_DIR>/data/geocode_cache.json` | Disk cache for Photon station geocoding. |
+| `GEOCODE_DELAY_SECONDS` | `1.1` | Delay between Photon requests (rate limiting). |
+| `PHOTON_CONNECT_TIMEOUT_SECONDS` | `5.0` | Photon connect timeout (seconds). |
+| `PHOTON_TIMEOUT_SECONDS` | `20.0` | Photon read timeout (seconds). |
+| `PHOTON_RETRIES` | `2` | Photon retry attempts. |
+| `PHOTON_MAX_CONSECUTIVE_FAILURES` | `10` | Abort threshold for bulk Photon geocoding. |
+| `STATION_SEARCH_RADIUS_MILES` | `5.0` | Max distance from route/start to consider a station. |
+| `TANK_RANGE_MILES` | `500.0` | Vehicle range on a full tank (miles). |
+| `MPG` | `10.0` | Vehicle fuel efficiency (miles per gallon). |
+| `CSV_FILE` | `<BASE_DIR>/fuel-prices-for-be-assessment.csv` | Fuel price CSV path for import. |
+
+## Data flow
+
+1. **Import (offline):** `import_fuel_prices` loads US stations/prices from the CSV into `FuelStation` (idempotent, keeps lowest price per station).
+2. **Geocoding (offline):** `geocode_fuel_stations` assigns `lat/lon` to stations (Photon bulk or Open-Meteo per city). Re-runs resume pending rows; the API never geocodes stations.
+3. **API (request-time):** resolve `start`/`finish` (text via configured geocoder or `"lat,lon"`), fetch one driving route from OSRM, find stations near the route, plan stops/purchases, return route GeoJSON, stops, and `total_fuel_cost`.
+
+## Management commands
+
+Run with `.venv\Scripts\python.exe manage.py <command> ...`
+
+### `import_fuel_prices`
+
+Imports US fuel stations from the assessment CSV (idempotent).
+
+- `--file PATH` (default: `CSV_FILE`): CSV file to import.
+
+```powershell
+.venv\Scripts\python.exe manage.py import_fuel_prices
 ```
 
-`import_fuel_prices` is idempotent: run it as often as you like (no duplicates are created).
-Free-text locations in API requests are resolved by **Open-Meteo** (keyless, city-level) and
-cached in memory; `"lat,lon"` inputs skip geocoding entirely.
-`geocode_fuel_stations` is the **only** code path that geocodes stations. It uses Photon,
-is rate limited to ~1 request/second (`GEOCODE_DELAY_SECONDS`), caches every result
-(including "not found") in `data/geocode_cache.json`, and uses `bulk_update`. The full import
-has ~6,626 US stations, so a complete sequential geocode takes roughly 2-2.5 hours. Use
-`--limit` for a demo and `--force` to retry already-geocoded rows; interrupted runs can be
-resumed by re-running without `--force`. The API never geocodes a station during a request.
+### `geocode_fuel_stations`
 
-For the NY -> LA verification below, stations in the cities along the route were geocoded
-with a small one-off shell snippet and `STATION_SEARCH_RADIUS_MILES=40` (see limitation #1).
+Geocodes stations into `lat/lon`. Not used by the API.
 
-## 3. Run
+- `--limit N` (default: `0`): max stations to process (Photon mode) or max cities (`--all-cities`).
+- `--force`: re-geocode rows that already have coordinates.
+- `--city CITY,ST` (repeatable): geocode all stations in a city with Open-Meteo (no Photon delay).
+- `--all-cities`: geocode every pending distinct city/state with Open-Meteo (resumable; aborts after `OPEN_METEO_MAX_CONSECUTIVE_FAILURES` consecutive failures).
 
-```bash
-.venv/Scripts/python.exe manage.py runserver
+```powershell
+# Photon bulk (rate-limited, resumable, cached in GEOCODE_CACHE_FILE)
+.venv\Scripts\python.exe manage.py geocode_fuel_stations --limit 100
+
+# Specific cities (Open-Meteo)
+.venv\Scripts\python.exe manage.py geocode_fuel_stations --city Phoenix,AZ --city Tucson,AZ
+
+# All pending cities
+.venv\Scripts\python.exe manage.py geocode_fuel_stations --all-cities
 ```
 
-Tests:
+## Running and testing
 
-```bash
-.venv/Scripts/python.exe manage.py test fuel -v 2
+```powershell
+.venv\Scripts\python.exe manage.py runserver
+.venv\Scripts\python.exe manage.py test fuel -v 2
 ```
 
----
-
-## 4. API
+## API
 
 ### `POST /api/route/`
 
-```bash
-curl -X POST http://127.0.0.1:8000/api/route/ \
-  -H "Content-Type: application/json" \
-  -d '{"start": "40.7128,-74.0060", "finish": "34.0522,-118.2437"}'
-```
+Request body (JSON): `start` and `finish` as `"lat,lon"` or free text (city/state, e.g. `"City, ST"`).
 
-Free text also works (city/state names, e.g. `"City, ST"`; street addresses are not supported):
+**Example (success, real execution with mocked routing and sample stations):**
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/route/ \
   -H "Content-Type: application/json" \
-  -d '{"start": "New York, NY", "finish": "Los Angeles, CA"}'
+  -d "{\"start\": \"33.4484,-112.0740\", \"finish\": \"31.8000,-110.0000\"}"
 ```
-
-Response (abbreviated):
 
 ```json
 {
-  "start": "40.7128,-74.0060",
-  "finish": "34.0522,-118.2437",
-  "route": {"type": "Feature", "geometry": {"type": "LineString", "coordinates": [[-74.0, 40.71], "..."]}, "properties": {}},
-  "distance_miles": 2794.2,
+  "start": "33.4484,-112.0740",
+  "finish": "31.8000,-110.0000",
+  "route": {
+    "type": "Feature",
+    "geometry": {
+      "type": "LineString",
+      "coordinates": [
+        [-112.074, 33.4484],
+        [-111.5, 33.0],
+        [-110.9747, 32.2226],
+        [-110.5, 32.0],
+        [-110.0, 31.8]
+      ]
+    },
+    "properties": {}
+  },
+  "distance_miles": 186.41,
   "stops": [
     {
-      "name": "S&G #88", "address": "I-80, EXIT ...", "city": "Toledo", "state": "OH",
-      "lat": 41.6, "lon": -83.5, "price_per_gallon": "3.00900000",
-      "miles_from_start": 553.48, "gallons_purchased": 50.0, "cost": "150.45"
+      "name": "Origin Stop",
+      "address": "I-10 Exit 1",
+      "city": "Phoenix",
+      "state": "AZ",
+      "lat": 33.4484,
+      "lon": -112.074,
+      "price_per_gallon": "3.19900000",
+      "miles_from_start": 0.0,
+      "gallons_purchased": 18.64,
+      "cost": "59.63"
     }
   ],
-  "total_fuel_cost": "738.61"
+  "total_fuel_cost": "59.63"
 }
 ```
 
-Errors: `400` for invalid/non-US/missing input, `422` when no station is reachable within
-500 miles, `502` when an external service fails.
+**Example (zero distance, real execution):**
+
+```json
+{
+  "start": "33.4484,-112.0740",
+  "finish": "33.4484,-112.0740",
+  "route": {
+    "type": "Feature",
+    "geometry": {
+      "type": "LineString",
+      "coordinates": [
+        [-112.074, 33.4484],
+        [-112.074, 33.4484]
+      ]
+    },
+    "properties": {}
+  },
+  "distance_miles": 0.0,
+  "stops": [],
+  "total_fuel_cost": "0.00"
+}
+```
+
+#### Error format
+
+All API errors use a uniform JSON body with a stable `code` and a fixed client `message` (original exception details are logged server-side only):
+
+```json
+{
+  "error": {
+    "code": "<stable_code>",
+    "message": "<fixed message>",
+    "details": {}
+  }
+}
+```
+
+#### Error codes
+
+| HTTP | `code` | Meaning |
+|---|---|---|
+| 400 | `bad_request` | Malformed input or missing/invalid parameters. |
+| 400 | `invalid_location` | Coordinates or resolved location outside the supported continental USA area (reason in `details`). |
+| 404 | `location_not_found` | Free-text location could not be resolved to a USA location. |
+| 422 | `route_not_feasible` | Request is valid but cannot be fulfilled (no drivable route, or no reachable/origin fuel station). |
+| 502 | `external_service_bad_response` | External service returned an invalid or unexpected response. |
+| 503 | `external_rate_limited` | External service rate limit exceeded (may include `Retry-After` response header). |
+| 503 | `external_service_unavailable` | External service unavailable or upstream server error. |
+| 504 | `external_service_timeout` | External service timed out. |
+| 500 | `server_misconfigured` | Server configuration error. |
+| 500 | `internal_error` | Unexpected internal error. |
+
+**Error examples (real execution):**
+
+400 `invalid_location`:
+```json
+{
+  "error": {
+    "code": "invalid_location",
+    "message": "Invalid location.",
+    "details": {
+      "input": "51.5,-0.1",
+      "reason": "outside_continental_us",
+      "supported_area": "continental USA (lat 24.4-49.4, lon -125.0 to -66.9)"
+    }
+  }
+}
+```
+
+400 `bad_request` (missing field):
+```json
+{
+  "error": {
+    "code": "bad_request",
+    "message": "Bad request.",
+    "details": {
+      "finish": ["This field is required."]
+    }
+  }
+}
+```
+
+404 `location_not_found`:
+```json
+{
+  "error": {
+    "code": "location_not_found",
+    "message": "Location not found.",
+    "details": { "input": "Atlantis" }
+  }
+}
+```
+
+422 `route_not_feasible`:
+```json
+{
+  "error": {
+    "code": "route_not_feasible",
+    "message": "Route is not feasible.",
+    "details": { "reason": "no_origin_station" }
+  }
+}
+```
+
+502 `external_service_bad_response`:
+```json
+{
+  "error": {
+    "code": "external_service_bad_response",
+    "message": "External service returned an invalid response.",
+    "details": {}
+  }
+}
+```
+
+503 `external_rate_limited` (with `Retry-After: 120` header when provided by the provider):
+```json
+{
+  "error": {
+    "code": "external_rate_limited",
+    "message": "External service rate limit exceeded.",
+    "details": {}
+  }
+}
+```
+
+503 `external_service_unavailable`:
+```json
+{
+  "error": {
+    "code": "external_service_unavailable",
+    "message": "External service is unavailable.",
+    "details": {}
+  }
+}
+```
+
+504 `external_service_timeout`:
+```json
+{
+  "error": {
+    "code": "external_service_timeout",
+    "message": "External service timed out.",
+    "details": {}
+  }
+}
+```
+
+500 `internal_error` (no trace or internal detail in body, even with `DEBUG=True`):
+```json
+{
+  "error": {
+    "code": "internal_error",
+    "message": "Internal server error.",
+    "details": {}
+  }
+}
+```
 
 ### `GET /api/route/map/`
 
-Simple Leaflet map (CDN) showing the route and numbered fuel stops:
+HTML map view (Leaflet). Query parameters: `start`, `finish` (same values as the API). Returns the same HTTP status and error `code` as the API on failure, rendered as a safe HTML message (no traces/internal details).
 
-```
-http://127.0.0.1:8000/api/route/map/?start=New%20York,%20NY&finish=Los%20Angeles,%20CA
-```
+Example: `http://127.0.0.1:8000/api/route/map/?start=33.4484,-112.0740&finish=31.8000,-110.0000`
 
-Every response also has an `X-Response-Time-Ms` header and a timing log line.
+## Architecture
 
----
+- **`fuel/views.py`**: thin HTTP layer (request parsing/validation delegation, service call, response). `RouteAPIView` (JSON) and `route_map` (HTML) use the same service; domain errors map to consistent statuses/codes.
+- **`fuel/serializers.py`**: request validation (`start`, `finish`).
+- **`fuel/services/planner.py`**: orchestration (`resolve_location` -> `get_route` -> `nearby_stations`/origin selection -> `plan_fuel_stops` -> response shape).
+- **`fuel/services/geocoding.py`**: request-time location resolution and provider clients (`OpenMeteoClient` for requests, `PhotonClient` for offline ETL/cache). Input/area validation and external-failure classification.
+- **`fuel/services/routing.py`**: OSRM routing, geometry simplification, caching, and external-failure/routability classification.
+- **`fuel/services/stations.py`**: station lookup near the route and origin selection (data access/projection).
+- **`fuel/services/fuel.py`**: pure fuel planning and cost calculation (no Django/DB/network).
+- **`fuel/exceptions.py`**: domain exception hierarchy, stable error catalog, and DRF exception handler (uniform error translation/logging).
+- **`fuel/models.py`**: `FuelStation` persistence.
+- **`fuel/management/commands/`**: offline, resumable/idempotent import and geocoding commands.
 
-## 5. CSV findings and assumptions
+## Decisions and limitations
 
-The supplied `fuel-prices-for-be-assessment.csv` has **8,151 rows**, 7 columns
-(`OPIS Truckstop ID, Truckstop Name, Address, City, State, Rack ID, Retail Price`),
-UTF-8 encoding, CRLF line endings, comma delimiter with quoted fields, and no missing values.
-Prices are decimal strings with 3-8 decimal places ($2.687-$6.399).
+- **Offline station geocoding:** the API never geocodes stations at request time. Station coordinates come from `geocode_fuel_stations` (Photon bulk or Open-Meteo by city/`--all-cities`, resumable and cached on disk for Photon).
+- **Route proximity:** candidate stations are those within `STATION_SEARCH_RADIUS_MILES` of the route geometry (bounding-box prefilter plus segment projection). Each stop is assigned a mile marker along the route; the origin station is the nearest candidate to the start within the search radius.
+- **Fuel/cost model:** 10 mpg, `TANK_RANGE_MILES` tank (500 mi). Initial purchase is made at the origin station and included in `total_fuel_cost` using the same buy rule as stops (sufficient for destination/cheaper reachable station, else fill). A zero-distance trip costs 0.
+- **Unroutable input:** OSRM `NoRoute`/`NoSegment` (e.g. points not snappable to the road network) are treated as `422 route_not_feasible` (valid input but not fulfillable), not as an external service failure.
+- **External rate limiting:** provider HTTP 429 is mapped to `503 external_rate_limited` and forwards `Retry-After` when supplied.
+- **Provider failures:** timeouts -> 504, connection/upstream 5xx/unavailable -> 503, invalid/unexpected responses -> 502. Client messages are fixed per code; request/exception details are logged server-side.
+- **Geocoding coverage/accuracy:** station geocoding may be approximate (e.g. city-centroid in Open-Meteo modes) and depends on imported/geocoded data and `STATION_SEARCH_RADIUS_MILES`; sparse coverage can yield `route_not_feasible`.
+- **Routing/geocoding providers:** defaults use the public OSRM demo and Open-Meteo; availability, quotas, and terms are governed by those services.
 
-- **No latitude/longitude columns.** Hence the separate one-time geocoding command.
-- 620 rows are Canadian provinces (ON, AB, BC, ...); they are filtered out (7,531 US rows).
-- 26 rows are exact duplicates and the same OPIS ID appears with several prices (different
-  racks/grades). Import keeps the **cheapest** price per OPIS ID: **6,626 US stations**.
-- `City` values have trailing spaces; they are trimmed on import.
-- Locations are validated against a continental-US bounding box (lat 24.4-49.4,
-  lon -125.0 to -66.9). `lat,lon` inputs are checked locally; free text is resolved with
-  Open-Meteo, filtered to `country_code=US` and then checked against the same box.
-  No reverse-geocoding call is made.
-- **Initial tank assumption:** the vehicle starts with a full 50-gallon tank. Fuel already
-  in that tank is treated as already paid for, so it contributes $0 to the reported total.
-
----
-
-## 6. Design decisions
-
-| Topic | Decision |
-| --- | --- |
-| Framework | Django 6.1.3 + DRF 3.18.3, SQLite (no PostGIS needed). |
-| Routing | Free public OSRM demo server, configurable via `ROUTING_URL`. One request returns distance + full geometry. |
-| Geocoding | Open-Meteo for free-text request input (keyless, city-level, Django-cache-backed); Photon only for the offline station command (file-cache-backed). `TEXT_GEOCODER=photon` switches the request-time provider back. |
-| Caching | Route and resolved-location results in Django's local-memory cache; identical requests make **zero** external calls. |
-| Geometry | Full OSRM geometry is simplified with Douglas-Peucker (~34k points -> ~4k) to keep responses small. The 5-mile station match uses a cheap equirectangular projection in pure Python (no Shapely/pyproj dependency). |
-| DB access | One indexed bounding-box query for candidate stations; no per-station external calls, no N+1. |
-| Money | `Decimal` throughout; gallons and stop costs rounded to cents. |
-
-### External calls per request
-
-| Input | Geocoding | Routing | Total |
-| --- | ---: | ---: | ---: |
-| `lat,lon` | 0 | 1 | **1** |
-| Free text | 2 Open-Meteo (one per endpoint) | 1 OSRM | **3** |
-| Cached repeat | 0 | 0 | **0** |
-
-Leaflet tiles load in the browser, not from the backend, so they are not counted here.
-One routing call is the ideal case; three total calls for free text is inside the
-assessment's accepted 2-3 range.
-
-### Fuel algorithm (`fuel/services/fuel.py`, pure/no I/O)
-
-Starting with a full tank, at each stop:
-
-1. If the destination is reachable with the fuel on board, buy only the gallons still needed
-   (or nothing) and finish.
-2. Otherwise, if a station with a lower price is reachable with a full tank, go to the
-   cheapest such station and buy only enough fuel to get there.
-3. Otherwise fill the tank at the furthest reachable station and continue.
-
-Stations behind the vehicle are ignored. `NoStationInRangeError` (HTTP 422) is raised if a
-gap larger than 500 miles cannot be covered. Tests cover short/exact-range trips, no
-stations, cheaper stations ahead vs. behind, fill-up, and range-limit boundaries.
-
-Measured on the real NY -> LA route (2,794 miles, 40-mile station radius in this demo):
-first request ~1.9 s (dominated by OSRM), cached repeat ~18 ms, 7 stops, $738.61.
-The free-text variant (`"New York, NY"` -> `"Los Angeles, CA"`) also returns 200 with
-7 stops ($738.51) using 2 Open-Meteo calls plus 1 OSRM call.
-
----
-
-## 7. Known limitations
-
-1. Station addresses are highway exits, which Photon usually cannot resolve. The importer
-   falls back to a **city centroid**, so station coordinates are approximate. The default
-   match radius is 5 miles; with city-level geocodes raise `STATION_SEARCH_RADIUS_MILES`
-   (20-40 works for the demo). If you need precise stops, geocode with a paid/accurate
-   provider once and store the results.
-2. The full station geocode is intentionally slow (~2-2.5 h at 1 req/sec) to stay inside
-   the public Photon demo's fair-use limits; `Retry-After` is honored, the disk cache makes
-   reruns/resumes cheap, and the command aborts after `PHOTON_MAX_CONSECUTIVE_FAILURES`
-   (default 10) so an outage does not burn through all stations. For a much faster bulk
-   pass, point `PHOTON_URL` at a private Photon instance and lower
-   `GEOCODE_DELAY_SECONDS`. It has not been run to completion in this checkout.
-3. The public OSRM demo server is rate-limited and has no SLA. For production, use your own
-   OSRM instance or OpenRouteService with `ORS_API_KEY` support added to `services/routing.py`.
-4. Only the continental USA is supported; Alaska, Hawaii and Canada are intentionally out of
-   scope. Coordinates are not reverse-geocoded, so a point in the ocean inside the bbox is
-   accepted.
-5. No traffic, road grade, wind, tank reserve, or different fuel grades are modelled. The
-   price used is the cheapest row per OPIS ID in the static CSV.
-6. `LocMemCache` is per-process (fine for `runserver`, not shared across workers). Use Redis
-   if you deploy with multiple workers. There is no authentication or API rate limiting.
-7. A GitHub remote and the demo video are handled separately from this checkout.
-8. Open-Meteo resolves city/town names only, not street addresses or highway exits. Use
-   `"lat,lon"` for exact points; set `TEXT_GEOCODER=photon` (or a paid provider) if
-   address-level free text is required.
+No secrets are stored in the repository; configure sensitive values (e.g. `SECRET_KEY`) in `.env`.

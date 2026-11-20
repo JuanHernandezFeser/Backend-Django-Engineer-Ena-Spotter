@@ -86,7 +86,7 @@ class OpenMeteoClientTests(TestCase):
         self.assertEqual(result["display_name"], "New York, United States")
         mock_get.assert_called_once_with(
             settings.OPEN_METEO_URL,
-            params={"name": "New York, NY", "count": 5,
+            params={"name": "New York, NY", "count": 20,
                     "language": "en", "format": "json"},
             headers={
                 "User-Agent": settings.PHOTON_USER_AGENT,
@@ -106,6 +106,33 @@ class OpenMeteoClientTests(TestCase):
         self.assertIsNone(client.search("Paris"))
         self.assertEqual(mock_get.call_count, 1)
 
+    @patch("fuel.services.geocoding.requests.get")
+    def test_search_falls_back_to_city_name_and_matches_state(self, mock_get):
+        mock_get.side_effect = [
+            open_meteo_response({"results": []}),
+            open_meteo_response({
+                "results": [
+                    {
+                        "name": "Aberdeen", "latitude": 45.4647,
+                        "longitude": -98.48648, "country_code": "US",
+                        "admin1": "South Dakota", "country": "United States",
+                    },
+                    {
+                        "name": "Aberdeen", "latitude": 39.50956,
+                        "longitude": -76.16412, "country_code": "US",
+                        "admin1": "Maryland", "country": "United States",
+                    },
+                ]
+            }),
+        ]
+
+        result = OpenMeteoClient().search("Aberdeen, MD")
+
+        self.assertEqual(result["lat"], 39.50956)
+        self.assertEqual(result["display_name"], "Aberdeen, Maryland, United States")
+        self.assertEqual(mock_get.call_count, 2)
+        self.assertEqual(mock_get.call_args_list[1].kwargs["params"]["name"], "Aberdeen")
+
     @patch("fuel.services.geocoding.OpenMeteoClient.search")
     def test_resolve_location_uses_open_meteo_by_default(self, mock_search):
         mock_search.return_value = {
@@ -124,25 +151,22 @@ class OpenMeteoClientTests(TestCase):
         self.assertEqual(mock_search.call_count, 1)
 
     @override_settings(TEXT_GEOCODER="photon")
-    @patch("fuel.services.geocoding.PhotonClient.search")
-    def test_resolve_location_can_use_photon_when_configured(self, mock_search):
-        mock_search.return_value = {
-            "lat": 36.5378651,
-            "lon": -95.221358,
-            "country_code": "us",
-            "display_name": "Big Cabin, Oklahoma, United States",
-        }
+    def test_request_time_geocoder_rejects_photon_provider(self):
+        from fuel.exceptions import ServerMisconfiguredError
 
-        self.assertEqual(
-            resolve_location("Big Cabin, OK"),
-            (36.5378651, -95.221358, "Big Cabin, Oklahoma, United States"),
-        )
-        self.assertEqual(mock_search.call_count, 1)
+        with self.assertRaises(ServerMisconfiguredError) as ctx:
+            get_text_geocoder()
+        self.assertEqual(ctx.exception.code, "server_misconfigured")
+        self.assertEqual(ctx.exception.status_code, 500)
 
-    def test_get_text_geocoder_rejects_unknown_provider(self):
+    def test_get_text_geocoder_rejects_unknown_provider_as_server_misconfiguration(self):
+        from fuel.exceptions import ServerMisconfiguredError
+
         with override_settings(TEXT_GEOCODER="nope"):
-            with self.assertRaises(GeocodingError):
+            with self.assertRaises(ServerMisconfiguredError) as ctx:
                 get_text_geocoder()
+        self.assertEqual(ctx.exception.code, "server_misconfigured")
+        self.assertEqual(ctx.exception.status_code, 500)
 
 
 class PhotonClientTests(TestCase):
@@ -239,9 +263,14 @@ class PhotonClientTests(TestCase):
             "display_name": "Paris, France",
         },
     )
-    def test_resolve_location_rejects_non_us_result(self, mock_search):
-        with self.assertRaises(LocationNotInUS):
+    def test_resolve_location_non_us_text_returns_location_not_found(self, mock_search):
+        from fuel.exceptions import LocationNotFoundError as DomainLocationNotFoundError
+
+        with self.assertRaises(DomainLocationNotFoundError) as ctx:
             resolve_location("Paris")
+        self.assertEqual(ctx.exception.code, "location_not_found")
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(ctx.exception.details, {"input": "Paris"})
         self.assertEqual(mock_search.call_count, 1)
 
 
@@ -263,4 +292,66 @@ class GeocodeCommandTests(TestCase):
         with self.assertRaises(CommandError):
             call_command("geocode_fuel_stations", limit=3, stderr=StringIO())
 
+        self.assertEqual(mock_search.call_count, 2)
+
+    @patch("fuel.management.commands.geocode_fuel_stations.OpenMeteoClient.search")
+    def test_command_geocodes_city_with_open_meteo(self, mock_search):
+        mock_search.return_value = {
+            "lat": 33.4484,
+            "lon": -112.074,
+            "country_code": "us",
+            "display_name": "Phoenix, Arizona, United States",
+        }
+        phoenix = FuelStation.objects.create(
+            opis_id=1, name="AZ Stop", address="Exit 1", city="Phoenix",
+            state="AZ", price_per_gallon="3.00",
+        )
+        other = FuelStation.objects.create(
+            opis_id=2, name="IL Stop", address="Exit 2", city="Phoenix",
+            state="IL", price_per_gallon="3.50",
+        )
+
+        call_command("geocode_fuel_stations", city=["Phoenix,AZ"])
+
+        phoenix.refresh_from_db()
+        other.refresh_from_db()
+        self.assertEqual(phoenix.lat, 33.4484)
+        self.assertEqual(phoenix.lon, -112.074)
+        self.assertIsNone(other.lat)
+        mock_search.assert_called_once_with("Phoenix, AZ")
+
+    @patch("fuel.management.commands.geocode_fuel_stations.OpenMeteoClient.search")
+    def test_command_geocodes_all_pending_cities(self, mock_search):
+        results = {
+            "Phoenix, AZ": {
+                "lat": 33.4484, "lon": -112.074, "country_code": "us",
+                "display_name": "Phoenix, Arizona, United States",
+            },
+            "Houston, TX": {
+                "lat": 29.7604, "lon": -95.3698, "country_code": "us",
+                "display_name": "Houston, Texas, United States",
+            },
+        }
+        mock_search.side_effect = lambda query: results[query]
+        phoenix = FuelStation.objects.create(
+            opis_id=1, name="PHX", address="Exit 1", city="Phoenix",
+            state="AZ", price_per_gallon="3.00",
+        )
+        houston = FuelStation.objects.create(
+            opis_id=2, name="HOU", address="Exit 2", city="Houston",
+            state="TX", price_per_gallon="3.10",
+        )
+        already = FuelStation.objects.create(
+            opis_id=3, name="DEN", address="Exit 3", city="Denver",
+            state="CO", lat=39.7, lon=-104.9, price_per_gallon="3.20",
+        )
+
+        call_command("geocode_fuel_stations", all_cities=True)
+
+        phoenix.refresh_from_db()
+        houston.refresh_from_db()
+        already.refresh_from_db()
+        self.assertEqual((phoenix.lat, phoenix.lon), (33.4484, -112.074))
+        self.assertEqual((houston.lat, houston.lon), (29.7604, -95.3698))
+        self.assertEqual((already.lat, already.lon), (39.7, -104.9))
         self.assertEqual(mock_search.call_count, 2)

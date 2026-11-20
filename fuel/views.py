@@ -1,23 +1,15 @@
-from django.http import HttpResponse
+import logging
+
 from django.shortcuts import render
 from django.views.decorators.http import require_GET
-from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from fuel.exceptions import BadRequestError, DomainError, sanitize_retry_after
 from fuel.serializers import RouteRequestSerializer
-from fuel.services.fuel import NoStationInRangeError
-from fuel.services.geocoding import GeocodingError, LocationNotInUS
 from fuel.services.planner import plan_route
-from fuel.services.routing import RoutingError
 
-
-def _error_status(exc: Exception) -> int:
-    if isinstance(exc, (LocationNotInUS, ValueError)):
-        return status.HTTP_400_BAD_REQUEST
-    if isinstance(exc, NoStationInRangeError):
-        return status.HTTP_422_UNPROCESSABLE_ENTITY
-    return status.HTTP_502_BAD_GATEWAY
+logger = logging.getLogger(__name__)
 
 
 class RouteAPIView(APIView):
@@ -28,33 +20,80 @@ class RouteAPIView(APIView):
         serializer.is_valid(raise_exception=True)
         start = serializer.validated_data["start"]
         finish = serializer.validated_data["finish"]
-
-        try:
-            result = plan_route(start, finish)
-        except (LocationNotInUS, GeocodingError, RoutingError, NoStationInRangeError) as exc:
-            return Response({"error": str(exc)}, status=_error_status(exc))
-
-        return Response(result)
+        return Response(plan_route(start, finish))
 
 
 @require_GET
 def route_map(request):
+    """Render an HTML map view for a route (same statuses/codes as the API)."""
     start = request.GET.get("start", "").strip()
     finish = request.GET.get("finish", "").strip()
     if not start or not finish:
-        return HttpResponse(
-            "Provide ?start=...&finish=... (e.g. 'New York, NY').", status=400
+        exc = BadRequestError(
+            detail="Missing start or finish query parameter.",
+            details={
+                k: v
+                for k, v in {
+                    "start": "This field is required." if not start else None,
+                    "finish": "This field is required." if not finish else None,
+                }.items()
+                if v
+            },
+        )
+        logger.warning("domain_error code=%s detail=%s", exc.code, exc.detail)
+        return render(
+            request,
+            "fuel/route_map.html",
+            {
+                "error": exc.message,
+                "error_code": exc.code,
+                "start": start,
+                "finish": finish,
+                "route": None,
+                "stops": [],
+            },
+            status=exc.status_code,
         )
 
     try:
         result = plan_route(start, finish)
-    except (LocationNotInUS, GeocodingError, RoutingError, NoStationInRangeError) as exc:
+    except DomainError as exc:
+        detail = exc.detail or str(exc)
+        if exc.status_code >= 500:
+            logger.error("domain_error code=%s detail=%s", exc.code, detail, exc_info=True)
+        else:
+            logger.warning("domain_error code=%s detail=%s", exc.code, detail)
+        response = render(
+            request,
+            "fuel/route_map.html",
+            {
+                "error": exc.message,
+                "error_code": exc.code,
+                "start": start,
+                "finish": finish,
+                "route": None,
+                "stops": [],
+            },
+            status=exc.status_code,
+        )
+        retry_after = sanitize_retry_after(exc.retry_after)
+        if retry_after is not None:
+            response["Retry-After"] = retry_after
+        return response
+    except Exception as exc:
+        logger.exception("unexpected_error detail=%s", str(exc))
         return render(
             request,
             "fuel/route_map.html",
-            {"error": str(exc), "start": start, "finish": finish,
-             "route": None, "stops": []},
-            status=_error_status(exc),
+            {
+                "error": "Internal server error.",
+                "error_code": "internal_error",
+                "start": start,
+                "finish": finish,
+                "route": None,
+                "stops": [],
+            },
+            status=500,
         )
 
-    return render(request, "fuel/route_map.html", {"error": None, **result})
+    return render(request, "fuel/route_map.html", {"error": None, "error_code": None, **result})

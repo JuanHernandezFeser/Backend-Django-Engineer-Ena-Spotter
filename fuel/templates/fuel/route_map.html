@@ -18,7 +18,7 @@
   <div id="map"></div>
   <div class="panel">
     <h2>{{ start }} &rarr; {{ finish }}</h2>
-    {% if error %}<p class="error">{{ error }}</p>{% endif %}
+    {% if error %}<p class="error">{% if error_code %}[{{ error_code }}] {% endif %}{{ error }}</p>{% endif %}
     {% if route %}
       <p>{{ distance_miles }} miles &middot; ${{ total_fuel_cost }} fuel &middot; {{ stops|length }} stop(s)</p>
       <table>
@@ -41,8 +41,9 @@
     const stops = JSON.parse(document.getElementById('stops-data').textContent);
     if (route) {
       const map = L.map('map');
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '&copy; OpenStreetMap contributors'
+      L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', {
+        attribution: 'Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ',
+        maxZoom: 17
       }).addTo(map);
       const line = L.geoJSON(route).addTo(map);
       map.fitBounds(line.getBounds(), { padding: [30, 30] });

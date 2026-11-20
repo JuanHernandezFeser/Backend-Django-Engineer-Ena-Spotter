@@ -74,6 +74,7 @@ REST_FRAMEWORK = {
         "rest_framework.renderers.JSONRenderer",
         "rest_framework.renderers.BrowsableAPIRenderer",
     ],
+    "EXCEPTION_HANDLER": "fuel.exceptions.custom_exception_handler",
 }
 
 CACHES = {
@@ -95,6 +96,9 @@ OPEN_METEO_URL = env(
     "OPEN_METEO_URL", default="https://geocoding-api.open-meteo.com/v1/search"
 )
 OPEN_METEO_TIMEOUT_SECONDS = env.float("OPEN_METEO_TIMEOUT_SECONDS", default=10.0)
+OPEN_METEO_MAX_CONSECUTIVE_FAILURES = env.int(
+    "OPEN_METEO_MAX_CONSECUTIVE_FAILURES", default=20
+)
 
 PHOTON_URL = env("PHOTON_URL", default="https://photon.komoot.io/api")
 PHOTON_USER_AGENT = env(

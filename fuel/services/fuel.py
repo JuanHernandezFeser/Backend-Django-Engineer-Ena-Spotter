@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 
+from fuel.exceptions import RouteNotFeasibleError
+
 EPS = Decimal("0.000001")
 CENT = Decimal("0.01")
 
@@ -37,7 +39,7 @@ class FuelPlan:
     total_cost: Decimal
 
 
-class NoStationInRangeError(Exception):
+class NoStationInRangeError(RouteNotFeasibleError):
     """Raised when the destination cannot be reached with the available stations."""
 
 
@@ -46,29 +48,47 @@ def plan_fuel_stops(
     total_distance_miles: float,
     range_miles: float = 500.0,
     mpg: float = 10.0,
+    origin_station: FuelStationOption | None = None,
 ) -> FuelPlan:
-    """Choose stops and gallons bought, starting with a full tank.
+    """Choose stops and gallons bought, starting with an initial purchase at origin.
 
-    Starting fuel is assumed to be already paid for, so it costs $0 here.
-    At each stop we can buy up to a full tank (range_miles / mpg gallons).
-    If a cheaper station is within a full tank's reach we buy only enough to
-    get there; otherwise we fill up at the furthest reachable station.
+    The trip is anchored at the origin station (position_miles on the route) with
+    no fuel, and the first purchase is decided with the same rule as later stops:
+    buy only what is needed to reach the destination or a cheaper reachable
+    station, otherwise fill the tank. If the effective distance is zero, no fuel
+    is bought.
     """
     distance = dec(total_distance_miles)
     tank_range = dec(range_miles)
     miles_per_gallon = dec(mpg)
     capacity_gallons = tank_range / miles_per_gallon
 
+    if distance <= EPS:
+        return FuelPlan(stops=[], total_cost=Decimal("0.00"))
+
+    if origin_station is None:
+        raise NoStationInRangeError(
+            "No fuel station available at the trip origin.",
+            details={"reason": "no_origin_station"},
+        )
+
+    position = dec(origin_station.position_miles)
+    if distance - position <= EPS:
+        return FuelPlan(stops=[], total_cost=Decimal("0.00"))
+
+    fuel_miles = Decimal(0)
+    current_station: FuelStationOption | None = origin_station
+    current_price: Decimal | None = origin_station.price
+    stops: list[FuelStop] = []
+
     upcoming = sorted(
-        (s for s in stations if dec(s.position_miles) > EPS),
+        (
+            s
+            for s in stations
+            if dec(s.position_miles) > position + EPS and s.id != origin_station.id
+        ),
         key=lambda s: s.position_miles,
     )
-
-    position = Decimal(0)
-    fuel_miles = tank_range
-    current_station: FuelStationOption | None = None
-    current_price: Decimal | None = None
-    stops: list[FuelStop] = []
 
     while distance - position > fuel_miles + EPS:
         remaining = distance - position
@@ -91,7 +111,8 @@ def plan_fuel_stops(
         if not reachable:
             raise NoStationInRangeError(
                 f"No fuel station within {range_miles:g} miles at mile "
-                f"{float(position):.1f} of {total_distance_miles:.1f}."
+                f"{float(position):.1f} of {total_distance_miles:.1f}.",
+                details={"reason": "no_reachable_station"},
             )
 
         if current_price is None:

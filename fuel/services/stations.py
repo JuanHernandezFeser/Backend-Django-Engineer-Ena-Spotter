@@ -6,7 +6,7 @@ from django.conf import settings
 
 from fuel.models import FuelStation
 
-from .fuel import FuelStationOption
+from .fuel import FuelStationOption, NoStationInRangeError
 
 MILES_PER_DEGREE_LAT = 69.172
 EARTH_RADIUS_MILES = 3958.8
@@ -21,6 +21,33 @@ def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> floa
         + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
     )
     return 2 * EARTH_RADIUS_MILES * math.asin(math.sqrt(a))
+
+
+def select_origin_station(
+    stations: list[FuelStationOption],
+    start_lat: float,
+    start_lon: float,
+    max_distance_miles: float | None = None,
+) -> FuelStationOption:
+    if not stations:
+        raise NoStationInRangeError(
+            "No fuel station available near the trip origin.",
+            details={"reason": "no_origin_station"},
+        )
+    radius = (
+        settings.STATION_SEARCH_RADIUS_MILES
+        if max_distance_miles is None
+        else max_distance_miles
+    )
+    origin = min(
+        stations, key=lambda s: _haversine_miles(start_lat, start_lon, s.lat, s.lon)
+    )
+    if _haversine_miles(start_lat, start_lon, origin.lat, origin.lon) > radius:
+        raise NoStationInRangeError(
+            "No fuel station available near the trip origin.",
+            details={"reason": "no_origin_station"},
+        )
+    return origin
 
 
 def nearby_stations(
