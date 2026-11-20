@@ -17,3 +17,19 @@ htmlcov/
 
 .DS_Store
 Thumbs.db
+
+# Variantes de entorno (excepto la plantilla)
+.env.*
+!.env.example
+
+# Python
+*.egg-info/
+.ruff_cache/
+
+# Editor
+.vscode/
+.idea/
+
+# Django
+staticfiles/
+media/
