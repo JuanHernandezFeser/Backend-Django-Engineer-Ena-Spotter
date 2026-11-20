@@ -316,7 +316,7 @@ All API errors use a uniform JSON body with a stable `code` and a fixed client `
 
 HTML map view (Leaflet). Query parameters: `start`, `finish` (same values as the API). Returns the same HTTP status and error `code` as the API on failure, rendered as a safe HTML message (no traces/internal details).
 
-Example: `http://127.0.0.1:8000/api/route/map/?start=33.4484,-112.0740&finish=31.8000,-110.0000`
+Example: `http://127.0.0.1:8000/api/route/map/?start=33.4484,-112.0740&finish=31.8000,-110.0000` or `http://127.0.0.1:8000/api/route/map/?start=Kansas&finish=Chicago`
 
 ## Architecture
 
